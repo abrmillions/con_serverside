@@ -12,7 +12,7 @@ env/
 # Django media/cache
 *.log
 db.sqlite3
-
+media/
 documents/202*
 static/
 .DS_Store
