@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Reply to your message</title>
+  <style>
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 14px; color: #111; margin: 0; padding: 16px; }
+    .block { border-left: 3px solid #2d3e8f; margin: 12px 0; padding: 8px 12px; background: #f6f8ff; }
+  </style>
+  </head>
+<body>
+  <p>Hello {{ name }},</p>
+  <p>Our team has replied to your message:</p>
+  <div class="block">
+    {{ text|linebreaksbr }}
+  </div>
+  <p>— {{ admin_name }}<br/>{{ system_name }}</p>
+</body>
+</html>

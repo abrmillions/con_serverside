@@ -1,0 +1,20 @@
+{
+  "id": 13,
+  "applicant": "e2e_1770037270@example.com",
+  "license_type": "contractor",
+  "data": {
+    "licenseType": "General",
+    "businessType": "Construction",
+    "registrationNumber": "REG12345",
+    "taxId": "TAX123",
+    "yearsInBusiness": 5,
+    "workScopes": [
+      "electrical",
+      "plumbing"
+    ],
+    "subtype": "grade-a"
+  },
+  "status": "pending",
+  "created_at": "2026-02-02T13:01:12.513196Z",
+  "updated_at": "2026-02-02T13:01:12.513229Z"
+}
