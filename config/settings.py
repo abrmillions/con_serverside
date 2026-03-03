@@ -111,15 +111,25 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
+import dj_database_url
+
 # Database: prefer explicit DB env vars for Postgres, otherwise SQLite
-if os.environ.get("DB_ENGINE"):
+if os.environ.get("DATABASE_URL"):
+    DATABASES = {
+        "default": dj_database_url.config(
+            default=os.environ.get("DATABASE_URL"),
+            conn_max_age=600,
+            conn_health_checks=True,
+        )
+    }
+elif os.environ.get("DB_ENGINE"):
     DATABASES = {
         "default": {
             "ENGINE": os.environ.get("DB_ENGINE"),
             "NAME": os.environ.get("DB_NAME"),
             "USER": os.environ.get("DB_USER"),
             "PASSWORD": os.environ.get("DB_PASSWORD"),
-            "HOST": os.environ.get("DB_HOST", "dpg-d6cqpspr0fns739e96ag-a.oregon-postgres.render.com"),
+            "HOST": os.environ.get("DB_HOST"),
             "PORT": os.environ.get("DB_PORT", "5432"),
         }
     }
