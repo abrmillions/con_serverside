@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: construction-backend
+    name: backend_server
     env: python
     plan: starter
     rootDir: backend
@@ -28,4 +28,3 @@ services:
         value: users.CustomUser
       - key: CORS_ALLOW_ALL_ORIGINS
         value: 1
-
