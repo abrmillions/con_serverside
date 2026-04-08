@@ -22,7 +22,7 @@ class ApplicationAdminForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         try:
             d = self.instance.data if isinstance(self.instance.data, dict) else {}
-            raw = d.get("grade") or d.get("licenseType") or d.get("category")
+            raw = d.get("grade") or d.get("licenseType") or d.get("category") or d.get("permitDetails") or d.get("permit_details")
             self.fields["grade"].initial = raw
             pos = d.get("position") or d.get("currentPosition") or d.get("current_position")
             self.fields["current_position"].initial = pos
@@ -48,6 +48,10 @@ class ApplicationAdminForm(forms.ModelForm):
                     d["grade"] = "Specialized Contractor"
                 else:
                     d["grade"] = val
+                # Sync permitDetails for Import/Export applications
+                if inst.license_type == "Import/Export License":
+                    d["permitDetails"] = val
+                    d["permit_details"] = val
             pos_val = self.cleaned_data.get("current_position")
             if pos_val is not None and str(pos_val).strip():
                 d["position"] = str(pos_val).strip()
@@ -72,7 +76,7 @@ class DocumentInline(admin.TabularInline):
             storage = obj.file.storage
             if not storage.exists(obj.file.name):
                 return format_html('<span style="color: #c00;">Missing file</span>')
-            return format_html('<a href="{}" target="_blank" rel="noopener">Download</a>', obj.file.url)
+            return format_html('<a href="{}" target="_blank" rel="noopener">View</a>', obj.file.url)
         except Exception:
             return "-"
 
@@ -480,6 +484,15 @@ class ApplicationAdmin(admin.ModelAdmin):
                     url = getattr(f, "url", None)
                     if url:
                         return format_html('<img src="{}" style="max-width:200px; height:auto; border:1px solid #ddd;"/>', url)
+            try:
+                from licenses.models import License
+                lic = License.objects.filter(owner=obj.applicant, license_type=obj.license_type).order_by("-issued_date").first()
+                if lic and getattr(lic, "license_photo", None):
+                    url = getattr(lic.license_photo, "url", None)
+                    if url:
+                        return format_html('<img src="{}" style="max-width:200px; height:auto; border:1px solid #ddd;"/>', url)
+            except Exception:
+                pass
         except Exception:
             pass
         return "-"
@@ -592,3 +605,19 @@ class ApplicationAdmin(admin.ModelAdmin):
         return resp
 
     download_documents_zip.short_description = "Download documents for selected applications (zip)"
+
+    def save_related(self, request, form, formsets, change):
+        super().save_related(request, form, formsets, change)
+        try:
+            obj = form.instance
+            for fs in formsets:
+                try:
+                    if fs.model is Document:
+                        for inst in fs.queryset.all():
+                            if not getattr(inst, "uploader_id", None):
+                                inst.uploader = request.user if request.user.is_authenticated else None
+                                inst.save(update_fields=["uploader"])
+                except Exception:
+                    continue
+        except Exception:
+            pass

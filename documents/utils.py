@@ -2,26 +2,38 @@ import os
 import re
 
 PATTERNS = [
-    (r"(national\s*id|nid|kebele)", "National ID Copy"),
-    (r"(company).*?(registration|reg\b)", "Company Registration"),
+    # 1. High Priority Domain Specific (Must be checked before general terms)
+    (r"\b(partnership|jv|clms).*agreement", "Partnership/JV Agreement"),
+    (r"\b(contract|award)\b", "Project Contract/Award Letter"),
+    (r"\b(guarantee|bond)\b", "Financial Guarantee/Bond"),
+    
+    # 2. Vehicle Specific (Must check 'vehicle' keyword to avoid capturing general registration)
+    (r"\b(vehicle).*(registration|reg\b)", "Vehicle Registration Certificate"),
+    (r"\b(insurance)\b", "Insurance Certificate"),
+    (r"\b(inspection|safety)\b", "Safety Inspection Certificate"),
+    (r"\b(ownership|title)\b", "Proof of Ownership"),
+
+    # 3. General Registration and Tax (Should catch 'registration' if NOT preceded by 'vehicle')
+    (r"\b(company).*?(registration|reg\b)", "Company Registration"),
     (r"\b(tax|tin|vat)\b", "Tax Certificate"),
+    (r"\bregistration\b", "Registration Certificate"),
+
+    # 4. Professional/Contractor Documents
+    (r"(national\s*id|nid|kebele)", "National ID Copy"),
     (r"(experience).*(letter)?", "Experience Letter"),
-    (r"(degree|diploma|certificate)", "Degree Certificate"),
     (r"(transcript)", "Transcripts"),
     (r"(previous).*(license)", "Previous License"),
     (r"(customs)", "Customs License"),
-    (r"(specs?|specification|specifications)", "Item Specifications"),
+    (r"\b(specs?|specification|specifications)\b", "Item Specifications"),
     (r"(pro\s*forma|proforma).*invoice", "Proforma Invoice"),
     (r"(invoice)", "Invoice"),
-    (r"(insurance)", "Insurance Certificate"),
-    (r"(vehicle).*(registration)|\bregistration\b", "Vehicle Registration Certificate"),
-    (r"(inspection|safety)", "Safety Inspection Certificate"),
-    (r"(ownership|title)", "Proof of Ownership"),
-    (r"(partnership|jv).*agreement", "Partnership/JV Agreement"),
+    
+    # Generic matches at the bottom
+    (r"(degree|diploma|graduat|university|college|educational).*certificate", "Degree Certificate"),
+    (r"(degree|diploma)", "Degree Certificate"),
     (r"(license)", "License"),
-    (r"(contract|award)", "Project Contract/Award Letter"),
-    (r"(guarantee|bond)", "Financial Guarantee/Bond"),
-    (r"(photo|image|picture)", "Photo"),
+    (r"(logo|photo|image|picture|profile)", "Company Logo/Photo"),
+    (r"(certificate)", "Certificate"),
 ]
 
 def infer_document_name(name_or_path: str) -> str:

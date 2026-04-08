@@ -11,7 +11,7 @@ def document_upload_path(instance, filename):
 
 
 class Document(models.Model):
-    uploader = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="documents")
+    uploader = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name="documents")
     file = models.FileField(upload_to=document_upload_path, verbose_name="File Link")
     name = models.CharField(max_length=255, blank=True, verbose_name="Document Type")
     uploaded_at = models.DateTimeField(auto_now_add=True)
@@ -40,7 +40,7 @@ class Document(models.Model):
     def file_link(self):
         try:
             if self.file and hasattr(self.file, "url"):
-                return format_html('<a href="{}" target="_blank">Download</a>', self.file.url)
+                return format_html('<a href="{}" target="_blank">View</a>', self.file.url)
         except Exception:
             return ""
         return ""

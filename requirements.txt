@@ -17,3 +17,8 @@ gunicorn
 cryptography
 qrcode
 whitenoise
+google-generativeai
+pymupdf
+google-genai
+pytesseract
+pdf2image

@@ -11,7 +11,7 @@ import os, base64
 
 class IsUploaderOrReadOnly(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
-        if request.method in permissions.SAFE_METHODS:
+        if request.method in permissions.SAFE_METHODS or (request.user and request.user.is_staff):
             return True
         return obj.uploader == request.user
 
@@ -55,8 +55,28 @@ class DocumentViewSet(viewsets.ModelViewSet):
         try:
             if not request.FILES.get("file") and not request.data.get("file"):
                 return Response({"detail": "No file provided"}, status=status.HTTP_400_BAD_REQUEST)
+            # Normalize fields
             if request.data.get("name") and "name" not in request.data:
                 request.data["name"] = request.data.get("name")
+            name = (request.data.get("name") or "").strip()
+            app_id = request.data.get("application") or request.data.get("application_id")
+            # Upsert: if a document with same application+name already exists for this uploader, replace the file
+            if app_id and name:
+                try:
+                    existing = Document.objects.filter(uploader=request.user, application_id=app_id, name=name).first()
+                except Exception:
+                    existing = None
+                incoming_file = request.FILES.get("file") or request.data.get("file")
+                if existing and incoming_file:
+                    try:
+                        # Replace file content; keep name and associations
+                        existing.file = incoming_file
+                        existing.uploaded_at = timezone.now()
+                        existing.save(update_fields=["file", "uploaded_at"])
+                    except Exception as e:
+                        return Response({"detail": f"Failed to update document: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+                    ser = DocumentSerializer(existing, context={"request": request})
+                    return Response(ser.data, status=status.HTTP_200_OK)
             return super().create(request, *args, **kwargs)
         except Exception as e:
             return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -64,107 +84,38 @@ class DocumentViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"])
     def verify(self, request, pk=None):
         try:
-            doc = self.get_object()
-        except Exception:
-            return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
-        try:
-            f = getattr(doc, "file", None)
-            if not f:
-                return Response({"detail": "No file"}, status=status.HTTP_400_BAD_REQUEST)
-            storage = f.storage
-            if not storage.exists(f.name):
-                return Response({"detail": "Missing file"}, status=status.HTTP_404_NOT_FOUND)
-            ext = ""
+            # First, check if the document exists globally to distinguish between 404 and 403
             try:
-                ext = os.path.splitext(f.name)[1].lower().strip(".")
-            except Exception:
-                ext = ""
-            b64 = None
-            if ext in ("jpg","jpeg","png","gif","webp"):
-                try:
-                    fh = storage.open(f.name, "rb")
-                    content = fh.read()
-                finally:
-                    try:
-                        fh.close()
-                    except Exception:
-                        pass
-                b64 = base64.b64encode(content).decode("ascii")
-            elif ext == "pdf":
-                try:
-                    import fitz
-                    fh = storage.open(f.name, "rb")
-                    try:
-                        content = fh.read()
-                    finally:
-                        try:
-                            fh.close()
-                        except Exception:
-                            pass
-                    doc_pdf = fitz.open(stream=content, filetype="pdf")
-                    page = doc_pdf.load_page(0)
-                    pix = page.get_pixmap()
-                    png_bytes = pix.tobytes("png")
-                    b64 = base64.b64encode(png_bytes).decode("ascii")
-                except Exception:
-                    b64 = None
-            if b64 is not None:
-                score = None
-                status_label = "inconclusive"
-                details = ""
-                try:
-                    from openai import OpenAI
-                    api_key = os.environ.get("OPENAI_API_KEY")
-                    if api_key:
-                        client = OpenAI(api_key=api_key)
-                        msg = [
-                            {"role": "system", "content": "You assess whether an Ethiopian license application document image is likely authentic or tampered. Consider layout conformity, official stamps/seals, dates, IDs, and editing artifacts. Return a likelihood between 0 and 1 and a short reason."},
-                            {"role": "user", "content": [{"type":"input_text","text":"Analyze authenticity and return score and reason."},{"type":"input_image","image_data":b64}]},
-                        ]
-                        r = client.chat.completions.create(model="gpt-4.1-mini", messages=msg)
-                        txt = r.choices[0].message.content or ""
-                        s = None
-                        try:
-                            import re
-                            m = re.search(r'([01](?:\.\d+)?)', txt)
-                            if m:
-                                s = float(m.group(1))
-                        except Exception:
-                            s = None
-                        score = s if s is not None else None
-                        details = txt
-                        if score is not None:
-                            true_t = 0.7
-                            fake_t = 0.3
-                            try:
-                                from django.conf import settings
-                                model_path = os.path.join(settings.MEDIA_ROOT, "datasets", "contractor", "model.json")
-                                if os.path.exists(model_path):
-                                    import json
-                                    with open(model_path, "r", encoding="utf-8") as mf:
-                                        cfg = json.load(mf)
-                                    tt = cfg.get("true_threshold")
-                                    if isinstance(tt, (int,float)):
-                                        true_t = float(tt)
-                            except Exception:
-                                pass
-                            status_label = "verified_true" if score >= true_t else ("verified_fake" if score <= fake_t else "inconclusive")
-                except Exception:
-                    score = None
-                    details = ""
-                    status_label = "inconclusive"
-                doc.verification_status = status_label
-                doc.verification_score = score
-                doc.verification_details = details
-                doc.verified_at = timezone.now()
-                doc.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                return Response({"status": status_label, "score": score, "details": details})
-            else:
-                doc.verification_status = "inconclusive"
-                doc.verification_score = None
-                doc.verification_details = ""
-                doc.verified_at = timezone.now()
-                doc.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                return Response({"status": "inconclusive"})
+                doc = Document.objects.get(pk=pk)
+            except Document.DoesNotExist:
+                return Response({"detail": f"Document ID {pk} not found."}, status=status.HTTP_404_NOT_FOUND)
+
+            # Check permissions manually if get_object is failing
+            if not request.user.is_staff and doc.uploader != request.user:
+                return Response({"detail": "Permission denied. Only the uploader or staff can verify this document."}, status=status.HTTP_403_FORBIDDEN)
+            
+            from applications.verification import perform_verification
+            
+            # Determine category
+            category = "General"
+            if doc.application:
+                category = (doc.application.license_type or "General").strip()
+            elif doc.vehicle:
+                category = "Vehicle Registration"
+            
+            # Use the robust verification engine
+            res = perform_verification([doc], category)
+            
+            # Extract first result
+            if res and res.get("results") and len(res["results"]) > 0:
+                first = res["results"][0]
+                return Response({
+                    "status": first.get("status"),
+                    "score": first.get("score"),
+                    "details": doc.verification_details,
+                })
+            
+            return Response({"detail": "Verification failed to produce results"}, status=status.HTTP_400_BAD_REQUEST)
+            
         except Exception as e:
-            return Response({"detail": str(e)}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": f"Verification system error: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)

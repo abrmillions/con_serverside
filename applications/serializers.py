@@ -1,6 +1,13 @@
 from rest_framework import serializers
-from .models import Application, ApplicationLog
+from .models import Application, ApplicationLog, Notification
 import json
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ['id', 'user', 'application', 'title', 'message', 'is_read', 'created_at']
+        read_only_fields = ['id', 'user', 'created_at']
 
 
 class ApplicationLogSerializer(serializers.ModelSerializer):

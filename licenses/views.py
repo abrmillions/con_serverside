@@ -617,10 +617,17 @@ class LicenseVerificationView(APIView):
         except License.DoesNotExist:
             return Response({"valid": False, "detail": "The license number you entered was not found in the database."}, status=status.HTTP_404_NOT_FOUND)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"License verification error: {tb}")
             msg = str(e)
             if 'not iterable' in msg.lower():
                 return Response({"valid": False, "detail": "The license number you entered was not found in the database."}, status=status.HTTP_404_NOT_FOUND)
-            return Response({"valid": False, "detail": f"An error occurred: {msg}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            return Response({
+                "valid": False, 
+                "detail": f"An error occurred: {msg}",
+                "traceback": tb if settings.DEBUG else None
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class LicenseDownloadView(APIView):

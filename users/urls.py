@@ -1,6 +1,6 @@
 from django.urls import path, include
 from rest_framework.routers import DefaultRouter
-from .views import RegisterView, MeView, LogoutView, UserViewSet, CheckEmailView, EmailVerificationRequestView, EmailVerificationConfirmView, FlexibleTokenObtainPairView, TokenLoginView, GoogleLoginView, GoogleCallbackView
+from .views import RegisterView, MeView, LogoutView, UserViewSet, CheckEmailView, EmailVerificationRequestView, EmailVerificationConfirmView, FlexibleTokenObtainPairView, TokenLoginView, GoogleLoginView, GoogleCallbackView, GoogleStatusView
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import PasswordResetRequestView, PasswordResetConfirmView
 
@@ -21,4 +21,5 @@ urlpatterns = [
     path("email-verification/confirm/", EmailVerificationConfirmView.as_view(), name="email_verification_confirm"),
     path("google/login/", GoogleLoginView.as_view(), name="google_login"),
     path("google/callback/", GoogleCallbackView.as_view(), name="google_callback"),
+    path("google/status/", GoogleStatusView.as_view(), name="google_status"),
 ]

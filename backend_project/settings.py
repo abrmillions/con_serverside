@@ -19,7 +19,7 @@ DEBUG = (os.environ.get("DJANGO_DEBUG") or os.environ.get("DEBUG") or "0") == "1
 
 _hosts = os.environ.get("DJANGO_ALLOWED_HOSTS") or os.environ.get("ALLOWED_HOSTS") or ""
 ALLOWED_HOSTS = _hosts.split(",") if _hosts else [
-    ".onrender.com",
+   
     "localhost",
     "127.0.0.1",
 ]
@@ -42,9 +42,17 @@ INSTALLED_APPS = [
     "partnerships",
     "payments",
     "applications",
+    "companies",
     "documents",
     "systemsettings",
+    "contact",
 ]
+
+# Email configuration with Brevo
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+# Note: The system also supports dynamic API keys from the SystemSettings database.
+# See systemsettings/brevo_email.py for the dynamic implementation.
+
 
 # Use custom user model from `users` app
 AUTH_USER_MODEL = "users.CustomUser"
@@ -57,6 +65,7 @@ MIDDLEWARE = [
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
+    "systemsettings.middleware.DynamicSessionTimeoutMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
@@ -95,7 +104,7 @@ DATABASES = {
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
-    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "systemsettings.validators.DynamicPasswordMinLengthValidator"},
     {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
     {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
 ]
@@ -126,8 +135,7 @@ if _csrf_origins:
     CSRF_TRUSTED_ORIGINS = [o.strip() for o in _csrf_origins.split(",") if o.strip()]
 else:
     CSRF_TRUSTED_ORIGINS = [
-        "https://*.vercel.app",
-        "https://*.onrender.com",
+       
         "http://localhost",
         "http://127.0.0.1",
     ]

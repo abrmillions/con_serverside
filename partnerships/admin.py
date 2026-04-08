@@ -13,7 +13,7 @@ class PartnershipDocumentInline(admin.TabularInline):
             storage = obj.file.storage
             if not storage.exists(obj.file.name):
                 return format_html('<span style="color: #c00;">Missing file</span>')
-            return format_html('<a href="{}" target="_blank" rel="noopener">Download</a>', obj.file.url)
+            return format_html('<a href="{}" target="_blank" rel="noopener">View</a>', obj.file.url)
         except Exception:
             return "-"
 

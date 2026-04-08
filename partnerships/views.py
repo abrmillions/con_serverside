@@ -14,7 +14,7 @@ class IsOwnerOrReadOnly(permissions.BasePermission):
     def has_object_permission(self, request, view, obj):
         if request.method in permissions.SAFE_METHODS:
             return True
-        return obj.owner == request.user
+        return obj.owner == request.user or request.user.is_staff or request.user.is_superuser
 
 
 def validate_partnership_rules(partnership: Partnership):
@@ -75,22 +75,8 @@ class PartnershipViewSet(viewsets.ModelViewSet):
         return Partnership.objects.filter(owner=user)
 
     def perform_create(self, serializer):
-        # Enforce: one partnership per user account (email)
         user = self.request.user
-        if Partnership.objects.filter(owner=user).exists():
-            raise serializers.ValidationError({"detail": "You have already registered a partnership with this account."})
         serializer.save(owner=user, status="pending")
-
-    @decorators.action(detail=False, methods=["post"], url_path="create")
-    def create_request(self, request):
-        """Contractor creates partnership"""
-        # Enforce: one partnership per user account (email)
-        if Partnership.objects.filter(owner=request.user).exists():
-            return response.Response({"detail": "You have already registered a partnership with this account."}, status=status.HTTP_400_BAD_REQUEST)
-        ser = self.get_serializer(data=request.data)
-        ser.is_valid(raise_exception=True)
-        partnership = ser.save(owner=request.user, status="pending")
-        return response.Response(self.get_serializer(partnership).data, status=status.HTTP_201_CREATED)
 
     @decorators.action(detail=True, methods=["post"], url_path="confirm")
     def confirm(self, request, pk=None):
@@ -174,6 +160,125 @@ class PartnershipViewSet(viewsets.ModelViewSet):
         from .models import PartnershipDocument
         PartnershipDocument.objects.create(partnership=obj, document_type=str(doc_type), file=file)
         return response.Response({"detail": "Uploaded"}, status=status.HTTP_201_CREATED)
+
+    @decorators.action(detail=True, methods=["post"], url_path="verify_documents")
+    def verify_documents(self, request, pk=None):
+        try:
+            partnership = self.get_object()
+            if not request.user.is_staff:
+                return response.Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+            
+            from applications.verification import perform_verification
+            docs = list(partnership.documents.all())
+            if not docs:
+                return response.Response({"detail": "No documents found to verify."}, status=status.HTTP_400_BAD_REQUEST)
+                
+            res = perform_verification(docs, "Partnership Registration")
+            return response.Response(res)
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            err_msg = f"Partnership Verification Error: {str(e)}"
+            print(f"{err_msg}\n{tb}")
+            return response.Response({
+                "detail": err_msg,
+                "traceback": tb if settings.DEBUG else None
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+@api_view(["POST", "OPTIONS"])
+@permission_classes([permissions.IsAuthenticated])
+def verify_single_document(request):
+    """Verify a single PartnershipDocument by its ID (Standalone View)."""
+    if request.method == "OPTIONS":
+        return response.Response(status=status.HTTP_200_OK)
+        
+    try:
+        doc_id = request.data.get("document_id")
+        print(f"DEBUG: verify_single_document view received doc_id='{doc_id}' (type={type(doc_id)})")
+        if not doc_id:
+            return response.Response({"detail": "document_id is required."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        doc = None
+        # Try PartnershipDocument first
+        from .models import PartnershipDocument
+        from documents.models import Document
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        
+        print("DEBUG: Attempting to find PartnershipDocument...")
+        try:
+            # Try direct lookup (handles integer string or UUID string depending on model field)
+            doc = PartnershipDocument.objects.get(id=doc_id)
+            print(f"DEBUG: Found PartnershipDocument with raw ID {doc_id}")
+        except (PartnershipDocument.DoesNotExist, ValueError, serializers.ValidationError, DjangoValidationError) as e:
+            print(f"DEBUG: PartnershipDocument direct lookup failed: {str(e)}")
+            # Try integer conversion fallback
+            try:
+                target_id = int(doc_id)
+                doc = PartnershipDocument.objects.get(id=target_id)
+                print(f"DEBUG: Found PartnershipDocument with converted integer ID {target_id}")
+            except (PartnershipDocument.DoesNotExist, ValueError, TypeError, DjangoValidationError) as e2:
+                print(f"DEBUG: PartnershipDocument integer fallback failed: {str(e2)}")
+                pass
+
+        if not doc:
+            print("DEBUG: PartnershipDocument not found, trying generic Document...")
+            # Fallback: check if it's a generic Document
+            try:
+                doc = Document.objects.get(id=doc_id)
+                print(f"DEBUG: Found generic Document with raw ID {doc_id}")
+            except (Document.DoesNotExist, ValueError, serializers.ValidationError, DjangoValidationError) as e3:
+                print(f"DEBUG: Generic Document direct lookup failed: {str(e3)}")
+                try:
+                    target_id = int(doc_id)
+                    doc = Document.objects.get(id=target_id)
+                    print(f"DEBUG: Found generic Document with converted integer ID {target_id}")
+                except (Document.DoesNotExist, ValueError, TypeError, DjangoValidationError) as e4:
+                    print(f"DEBUG: Generic Document integer fallback failed: {str(e4)}")
+                    pass
+
+        if not doc:
+            print(f"DEBUG: No document found for ID '{doc_id}' in any model.")
+            return response.Response({"detail": f"Document ID {doc_id} not found in Partnership or General documents."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not request.user.is_staff:
+            return response.Response({"detail": "Permission denied. Staff only."}, status=status.HTTP_403_FORBIDDEN)
+        
+        from applications.verification import perform_verification
+        # Check if doc has a partnership or not to determine category label
+        category = "Partnership Registration"
+        
+        # Check for PartnershipDocument
+        if hasattr(doc, 'partnership') and doc.partnership:
+            category = "Partnership Registration"
+            print(f"DEBUG: Category determined as Partnership Registration (Partnership ID: {doc.partnership.id})")
+        # Check for General Document
+        elif hasattr(doc, 'application') and doc.application:
+            category = getattr(doc.application, "license_type", "General")
+            print(f"DEBUG: Category determined as {category} from application")
+        elif hasattr(doc, 'vehicle') and doc.vehicle:
+            category = "Vehicle Registration"
+            print("DEBUG: Category determined as Vehicle Registration")
+        
+        print(f"DEBUG: Calling perform_verification for category='{category}'")
+        try:
+            res = perform_verification([doc], category)
+            print(f"DEBUG: perform_verification success: {res}")
+            return response.Response(res)
+        except Exception as ai_err:
+            import traceback
+            tb = traceback.format_exc()
+            print(f"CRITICAL: perform_verification crashed: {ai_err}\n{tb}")
+            return response.Response({
+                "detail": f"Verification processing error: {str(ai_err)}",
+                "traceback": tb if settings.DEBUG else None
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"CRITICAL: Standalone partnership document verification outer exception: {tb}")
+        return response.Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class PartnershipPublicView(APIView):

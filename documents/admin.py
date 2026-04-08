@@ -19,6 +19,14 @@ class DocumentAdmin(admin.ModelAdmin):
     readonly_fields = ("file_link",)
     actions = ("normalize_names",)
 
+    def save_model(self, request, obj, form, change):
+        if not getattr(obj, "uploader_id", None):
+            try:
+                obj.uploader = request.user if request and request.user.is_authenticated else None
+            except Exception:
+                obj.uploader = None
+        super().save_model(request, obj, form, change)
+
     def file_link(self, obj):
         try:
             # Check that the file actually exists on disk/storage
@@ -26,7 +34,7 @@ class DocumentAdmin(admin.ModelAdmin):
             if not storage.exists(obj.file.name):
                 return format_html('<span style="color: #c00;">Missing file</span>')
             url = obj.file.url
-            return format_html('<a href="{}" target="_blank" rel="noopener">Download</a>', url)
+            return format_html('<a href="{}" target="_blank" rel="noopener">View</a>', url)
         except Exception:
             return "-"
 

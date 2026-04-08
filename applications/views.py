@@ -2,19 +2,40 @@ from rest_framework import viewsets, permissions, decorators, response, status
 from datetime import date
 from django.utils.text import slugify
 from django.http import HttpResponse
+from .notifications import send_application_notification
 import io
 import zipfile
 import os
+import base64
 
-from .models import Application, ApplicationLog
-from .serializers import ApplicationSerializer
+from .models import Application, ApplicationLog, Notification
+from .serializers import ApplicationSerializer, NotificationSerializer
 from licenses.models import License
 from licenses.serializers import LicenseSerializer
 from documents.models import DocumentAccessLog, Document
-from rest_framework import decorators, response, status, permissions, viewsets
+from .verification import perform_verification
 from django.utils import timezone
 from django.urls import reverse
 from django.core.mail import send_mail
+from documents.utils import infer_document_name
+import logging
+
+logger = logging.getLogger(__name__)
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    fitz = None
+try:
+    from PIL import Image
+except Exception:
+    Image = None
+try:
+    from google import genai as genai_new
+    from google.genai import types as genai_types
+except Exception:
+    genai_new = None
+    genai_types = None
 
 
 class IsApplicantOrReadOnly(permissions.BasePermission):
@@ -31,12 +52,13 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         user = self.request.user
         if user.is_staff:
-            return Application.objects.all()
-        return Application.objects.filter(applicant=user)
+            return Application.objects.all().order_by("-created_at")
+        return Application.objects.filter(applicant=user).order_by("-created_at")
 
     def create(self, request, *args, **kwargs):
         user = request.user
         requested_type = None
+        logger.info(f"User {user.email} is creating a new application.")
         try:
             if isinstance(request.data, dict):
                 requested_type = request.data.get('license_type')
@@ -77,15 +99,8 @@ class ApplicationViewSet(viewsets.ModelViewSet):
                     if not bypass_checks:
                         return response.Response({"detail": "You already have a license and cannot create another application without specifying a license_type."}, status=status.HTTP_403_FORBIDDEN)
             else:
-                # Allow multiple Professional License applications; keep restriction for others
-                is_prof = isinstance(requested_type, str) and ('professional' in requested_type.lower())
-                if not is_prof and License.objects.filter(owner=user, license_type=requested_type).exists():
-                    if not bypass_checks:
-                        return response.Response({"detail": "You already hold a license of this type. Duplicate applications are not allowed."}, status=status.HTTP_403_FORBIDDEN)
-                # Allow multiple active Professional License applications as well
-                if not is_prof and Application.objects.filter(applicant=user, license_type=requested_type).exclude(status='rejected').exists():
-                    if not bypass_checks:
-                        return response.Response({"detail": "You already have an active application for this license type."}, status=status.HTTP_403_FORBIDDEN)
+                # Allow multiple applications regardless of existing licenses or applications
+                pass
 
             return super().create(request, *args, **kwargs)
         except Exception as e:
@@ -449,35 +464,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             try:
                 existing_download = request.build_absolute_uri(reverse('license-download', args=[existing.id]))
                 recipient = getattr(app.applicant, 'email', None)
-                if recipient:
-                    subject = "Your license update has been approved"
-                    text_body = (
-                        "Your application has been approved.\n"
-                        f"Download your updated certificate: {existing_download}\n"
-                    )
-                    html_body = f"""
-                    <div style="font-family:Arial,sans-serif;line-height:1.5">
-                      <h2 style="margin:0 0 10px">License Update Approved</h2>
-                      <p>Your application has been approved.</p>
-                      <p>
-                        <a href="{existing_download}" style="display:inline-block;padding:10px 14px;background:#2563eb;color:#fff;text-decoration:none;border-radius:6px">
-                          Download Certificate
-                        </a>
-                      </p>
-                      <p style="font-size:12px;color:#64748b;margin-top:18px">
-                        If the button above does not work, copy and paste this link into your browser:<br />
-                        <span>{existing_download}</span>
-                      </p>
-                    </div>
-                    """
-                    send_mail(
-                        subject=subject,
-                        message=text_body,
-                        from_email=None,
-                        recipient_list=[recipient],
-                        html_message=html_body,
-                        fail_silently=True,
-                    )
+                # Notification is now handled automatically by signals
             except Exception:
                 pass
             app.approve()
@@ -619,35 +606,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         try:
             download_url = request.build_absolute_uri(reverse('license-download', args=[lic.id]))
             recipient = getattr(app.applicant, 'email', None)
-            if recipient:
-                subject = "Your license has been issued"
-                text_body = (
-                    "Your application has been approved.\n"
-                    f"Download your certificate: {download_url}\n"
-                )
-                html_body = f"""
-                <div style="font-family:Arial,sans-serif;line-height:1.5">
-                  <h2 style="margin:0 0 10px">License Issued</h2>
-                  <p>Your application has been approved and your license is now active.</p>
-                  <p>
-                    <a href="{download_url}" style="display:inline-block;padding:10px 14px;background:#16a34a;color:#fff;text-decoration:none;border-radius:6px">
-                      Download Certificate
-                    </a>
-                  </p>
-                  <p style="font-size:12px;color:#64748b;margin-top:18px">
-                    If the button above does not work, copy and paste this link into your browser:<br />
-                    <span>{download_url}</span>
-                  </p>
-                </div>
-                """
-                send_mail(
-                    subject=subject,
-                    message=text_body,
-                    from_email=None,
-                    recipient_list=[recipient],
-                    html_message=html_body,
-                    fail_silently=True,
-                )
+            # Notification is now handled automatically by signals
         except Exception:
             pass
         return response.Response(self.get_serializer(app).data)
@@ -663,6 +622,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             action="rejected",
             details=reason
         )
+        # Notification is now handled automatically by signals
         return response.Response(self.get_serializer(app).data)
 
     @decorators.action(detail=True, methods=["post"], url_path="request_info")
@@ -676,6 +636,7 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             action="info_requested",
             details=f"Information requested: {', '.join(info_needed) if isinstance(info_needed, list) else str(info_needed)}"
         )
+        # Notification is now handled automatically by signals
         return response.Response(self.get_serializer(app).data)
 
     @decorators.action(detail=True, methods=["get"], url_path="download_documents")
@@ -762,153 +723,87 @@ class ApplicationViewSet(viewsets.ModelViewSet):
         The endpoint will attempt to locate a License by matching the stored
         `data.application_id` or by owner+license_type as a fallback.
         """
-        app = self.get_object()
-        # Find license for same owner and license_type (model has no direct FK to application)
-        license_qs = License.objects.filter(owner=app.applicant, license_type=app.license_type).order_by("-created_at")
+        try:
+            app = self.get_object()
+            # Find license for same owner and license_type (model has no direct FK to application)
+            license_qs = License.objects.filter(owner=app.applicant, license_type=app.license_type).order_by("-created_at")
 
-        if not license_qs.exists():
-            return response.Response({"detail": "No license found for this application."}, status=status.HTTP_404_NOT_FOUND)
+            if not license_qs.exists():
+                return response.Response({"detail": "No license found for this application."}, status=status.HTTP_404_NOT_FOUND)
 
-        lic = license_qs.first()
-        lic_serialized = LicenseSerializer(lic, context={"request": request}).data
-        return response.Response(lic_serialized)
+            lic = license_qs.first()
+            lic_serialized = LicenseSerializer(lic, context={"request": request}).data
+            return response.Response(lic_serialized)
+        except Exception as e:
+            import traceback
+            print(f"Error in get_license: {e}")
+            print(traceback.format_exc())
+            return response.Response({"detail": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @decorators.action(detail=True, methods=["post"], url_path="verify_documents")
     def verify_documents(self, request, pk=None):
         app = self.get_object()
         if not request.user.is_staff:
             return response.Response({"detail": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+        
+        from documents.models import Document
+        from partnerships.models import Partnership, PartnershipDocument
+        from vehicles.models import Vehicle
+
+        # 1. Documents directly linked to application
         docs = list(app.documents.all())
-        results = []
-        for d in docs:
-            try:
-                f = getattr(d, "file", None)
-                st = getattr(d, "verification_status", "") or ""
-                if not f:
-                    results.append({"document_id": d.id, "status": "missing"})
-                    continue
-                if hasattr(f, "storage") and f.storage.exists(f.name):
-                    from django.urls import reverse
-                    try:
-                        d.verification_status = "pending"
-                        d.verification_score = None
-                        d.verification_details = ""
-                        d.verified_at = timezone.now()
-                        d.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                    except Exception:
-                        pass
-                    try:
-                        ext = ""
-                        import os
-                        ext = os.path.splitext(f.name)[1].lower().strip(".")
-                        b64 = None
-                        if ext in ("jpg","jpeg","png","gif","webp"):
-                            from openai import OpenAI
-                            import base64
-                            api_key = os.environ.get("OPENAI_API_KEY")
-                            if api_key:
-                                client = OpenAI(api_key=api_key)
-                                fh = f.storage.open(f.name, "rb")
-                                try:
-                                    content = fh.read()
-                                finally:
-                                    try:
-                                        fh.close()
-                                    except Exception:
-                                        pass
-                                b64 = base64.b64encode(content).decode("ascii")
-                        elif ext == "pdf":
-                            try:
-                                import fitz, base64
-                                fh = f.storage.open(f.name, "rb")
-                                try:
-                                    content = fh.read()
-                                finally:
-                                    try:
-                                        fh.close()
-                                    except Exception:
-                                        pass
-                                doc_pdf = fitz.open(stream=content, filetype="pdf")
-                                page = doc_pdf.load_page(0)
-                                pix = page.get_pixmap()
-                                png_bytes = pix.tobytes("png")
-                                b64 = base64.b64encode(png_bytes).decode("ascii")
-                            except Exception:
-                                b64 = None
-                        if b64 is not None:
-                            from openai import OpenAI
-                            api_key = os.environ.get("OPENAI_API_KEY")
-                            if api_key:
-                                client = OpenAI(api_key=api_key)
-                                msg = [
-                                    {"role": "system", "content": "You assess whether an Ethiopian license application document image is likely authentic or tampered. Consider layout conformity, official stamps/seals, dates, IDs, and editing artifacts. Return a likelihood between 0 and 1 and a short reason."},
-                                    {"role": "user", "content": [{"type":"input_text","text":"Analyze authenticity and return score and reason."},{"type":"input_image","image_data":b64}]},
-                                ]
-                                r = client.chat.completions.create(model="gpt-4.1-mini", messages=msg)
-                                txt = r.choices[0].message.content or ""
-                                s = None
-                                try:
-                                    import re
-                                    m = re.search(r'([01](?:\.\d+)?)', txt)
-                                    if m:
-                                        s = float(m.group(1))
-                                except Exception:
-                                    s = None
-                                status_label = "inconclusive"
-                                true_t = 0.7
-                                fake_t = 0.3
-                                try:
-                                    from django.conf import settings
-                                    model_path = os.path.join(settings.MEDIA_ROOT, "datasets", "contractor", "model.json")
-                                    if os.path.exists(model_path):
-                                        import json
-                                        with open(model_path, "r", encoding="utf-8") as mf:
-                                            cfg = json.load(mf)
-                                        tt = cfg.get("true_threshold")
-                                        if isinstance(tt, (int,float)):
-                                            true_t = float(tt)
-                                except Exception:
-                                    pass
-                                if s is not None:
-                                    status_label = "verified_true" if s >= true_t else ("verified_fake" if s <= fake_t else "inconclusive")
-                                d.verification_status = status_label
-                                d.verification_score = s
-                                d.verification_details = txt
-                                d.verified_at = timezone.now()
-                                d.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                                results.append({"document_id": d.id, "status": status_label, "score": s, "details": txt})
-                            else:
-                                d.verification_status = "inconclusive"
-                                d.verification_score = None
-                                d.verification_details = ""
-                                d.verified_at = timezone.now()
-                                d.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                                results.append({"document_id": d.id, "status": "inconclusive"})
-                        else:
-                            d.verification_status = "inconclusive"
-                            d.verification_score = None
-                            d.verification_details = "Unsupported or unreadable file type for verification"
-                            d.verified_at = timezone.now()
-                            d.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                            results.append({"document_id": d.id, "status": "inconclusive"})
-                    except Exception as e:
-                        try:
-                            d.verification_status = "error"
-                            d.verification_score = None
-                            d.verification_details = str(e)
-                            d.verified_at = timezone.now()
-                            d.save(update_fields=["verification_status","verification_score","verification_details","verified_at"])
-                        except Exception:
-                            pass
-                        results.append({"document_id": d.id, "status": "error", "detail": str(e)})
-                else:
-                    results.append({"document_id": d.id, "status": "missing"})
-            except Exception as e:
-                results.append({"document_id": getattr(d, "id", None), "status": "error", "detail": str(e)})
-        # Summary counts to surface overall application verification status
-        summary = {"verified_true": 0, "verified_fake": 0, "inconclusive": 0, "pending": 0, "missing": 0, "error": 0}
-        for r in results:
-            st = r.get("status")
-            if st in summary:
-                summary[st] += 1
-        return response.Response({"results": results, "summary": summary})
+        
+        # 2. User-level documents (uploaded by applicant, not linked to any app/vehicle/partnership)
+        user_docs = Document.objects.filter(
+            uploader=app.applicant, 
+            application__isnull=True, 
+            vehicle__isnull=True
+        )
+        for d in user_docs:
+            if d not in docs:
+                docs.append(d)
+
+        # 3. Vehicle documents for vehicles owned by applicant
+        user_vehicles = Vehicle.objects.filter(owner=app.applicant)
+        for v in user_vehicles:
+            v_docs = Document.objects.filter(vehicle=v)
+            for d in v_docs:
+                if d not in docs:
+                    docs.append(d)
+
+        # 4. Partnership documents for partnerships owned by applicant
+        user_partnerships = Partnership.objects.filter(owner=app.applicant)
+        for p in user_partnerships:
+            p_docs = PartnershipDocument.objects.filter(partnership=p)
+            for pd in p_docs:
+                if pd not in docs:
+                    docs.append(pd)
+
+        category = (app.license_type or "General").strip()
+        res = perform_verification(docs, category)
+        return response.Response(res)
+
+
+class NotificationViewSet(viewsets.ModelViewSet):
+    serializer_class = NotificationSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        return Notification.objects.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        serializer.save(user=self.request.user)
+
+    @decorators.action(detail=True, methods=["post"], url_path="mark-read")
+    def mark_read(self, request, pk=None):
+        notification = self.get_object()
+        notification.is_read = True
+        notification.save()
+        return response.Response({"status": "notification marked as read"})
+
+    @decorators.action(detail=False, methods=["post"], url_path="mark-all-read")
+    def mark_all_read(self, request):
+        self.get_queryset().update(is_read=True)
+        return response.Response({"status": "all notifications marked as read"})
+
+

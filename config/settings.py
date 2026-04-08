@@ -1,6 +1,7 @@
 
 from pathlib import Path
 import os
+from decouple import config
 try:
     from dotenv import load_dotenv
 except Exception:
@@ -27,26 +28,34 @@ ALLOWED_HOSTS = _hosts.split(",") if _hosts else []
 _csrf = os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS") or os.environ.get("CSRF_TRUSTED_ORIGINS") or ""
 CSRF_TRUSTED_ORIGINS = [o for o in _csrf.split(",") if o] if _csrf else []
 
-if DEBUG and not ALLOWED_HOSTS:
-    ALLOWED_HOSTS = [".onrender.com"]
+# In development, always allow common origins and hosts
+if DEBUG:
+    ALLOWED_HOSTS = ["*"]
     if not CSRF_TRUSTED_ORIGINS:
         CSRF_TRUSTED_ORIGINS = [
-            "https://serverside-nciz.onrender.com",
+     
             "https://clientside-ten.vercel.app",
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:8000",
+            "http://127.0.0.1:8000",
+           
         ]
+    # Ensure local dev also trusts same-origin requests
+    CSRF_TRUSTED_ORIGINS += ["http://localhost:8000", "http://127.0.0.1:8000"]
 
 # Safe defaults for Render if not explicitly configured
 if not DEBUG:
     if not ALLOWED_HOSTS:
         ALLOWED_HOSTS = [
-            ".onrender.com",
+         
             "localhost",
             "127.0.0.1",
             "[::1]",
         ]
     if not CSRF_TRUSTED_ORIGINS:
         CSRF_TRUSTED_ORIGINS = [
-            "https://serverside-nciz.onrender.com",
+          
             "https://clientside-ten.vercel.app",
         ]
 INSTALLED_APPS = [
@@ -78,6 +87,7 @@ AUTH_USER_MODEL = os.environ.get("AUTH_USER_MODEL", "users.CustomUser")
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -85,6 +95,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
+    "config.middleware.MaintenanceModeMiddleware",
 ]
 
 ROOT_URLCONF = "config.urls"
@@ -108,12 +119,16 @@ TEMPLATES = [
 WSGI_APPLICATION = "config.wsgi.application"
 ASGI_APPLICATION = "config.asgi.application"
 
-# Database: Use SQLite as the primary database
+import dj_database_url
+
+# Database configuration: Use environment variables for production (e.g., PostgreSQL)
+# Defaults to SQLite for local development if DATABASE_URL is not set.
 DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
-    }
+    "default": dj_database_url.config(
+        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        conn_max_age=600,
+        conn_health_checks=True,
+    )
 }
 
 AUTH_PASSWORD_VALIDATORS = [
@@ -132,13 +147,6 @@ STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-
-# Only apply WhiteNoise middleware outside of development AND when STATIC_ROOT exists
-try:
-    if not DEBUG and STATIC_ROOT.exists():
-        MIDDLEWARE.insert(1, "whitenoise.middleware.WhiteNoiseMiddleware")
-except Exception:
-    pass
 
 # Media files
 MEDIA_URL = "/media/"
@@ -171,6 +179,7 @@ SIMPLE_JWT = {
 CORS_ALLOWED_ORIGINS = os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if os.environ.get("CORS_ALLOWED_ORIGINS") else []
 CORS_ALLOW_ALL_ORIGINS = True
 CORS_ALLOW_CREDENTIALS = True
+APPEND_SLASH = True
 CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https://.*\.vercel\.app$",
 ]
@@ -195,3 +204,81 @@ QR_TOKEN_MAX_AGE_SECONDS = int(os.environ.get('QR_TOKEN_MAX_AGE_SECONDS', str(60
 
 # Ensure correct scheme on Render behind proxy
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# Chapa Payment Integration
+FRONTEND_URL = config("FRONTEND_URL", default="http://localhost:3000")
+
+# Logging Configuration
+LOGS_DIR = BASE_DIR / "logs"
+if not LOGS_DIR.exists():
+    try:
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+# Determine log handler based on environment and OS
+if DEBUG and os.name == 'nt':
+    # On Windows during development, use standard FileHandler to avoid PermissionError
+    # when Django's autoreloader starts multiple processes.
+    file_handler_class = "logging.FileHandler"
+    file_handler_kwargs = {}
+else:
+    # In production or non-Windows, use TimedRotatingFileHandler for daily logs
+    file_handler_class = "logging.handlers.TimedRotatingFileHandler"
+    file_handler_kwargs = {
+        "when": "midnight",
+        "interval": 1,
+        "backupCount": 7,
+    }
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "{levelname} {asctime} {module} {process:d} {thread:d} {message}",
+            "style": "{",
+        },
+        "simple": {
+            "format": "{levelname} {asctime} {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "file": {
+            "level": "INFO",
+            "class": file_handler_class,
+            "filename": LOGS_DIR / "clms_backend.log",
+            "formatter": "verbose",
+            "encoding": "utf-8",
+            **file_handler_kwargs,
+        },
+        "console": {
+            "level": "INFO",
+            "class": "logging.StreamHandler",
+            "formatter": "simple",
+        },
+    },
+    "root": {
+        "handlers": ["console", "file"],
+        "level": "INFO",
+    },
+    "loggers": {
+        "django": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "applications": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "documents": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+

@@ -14,20 +14,25 @@ class VehicleSerializer(serializers.ModelSerializer):
         read_only_fields = ("id", "owner", "registeredAt")
 
     def create(self, validated_data):
-        data = validated_data.get("data") or {}
-        if isinstance(data, dict):
-            validated_data["plate_number"] = validated_data.get("plate_number") or data.get("plateNumber")
-            validated_data["chassis_number"] = validated_data.get("chassis_number") or data.get("chassisNumber")
-            validated_data["vin"] = validated_data.get("vin") or data.get("vin") or data.get("engineNumber")
-            validated_data["make"] = validated_data.get("make") or data.get("manufacturer")
-            validated_data["model"] = validated_data.get("model") or data.get("model")
-            yr = validated_data.get("year") or data.get("year")
-            if yr is not None:
-                try:
-                    validated_data["year"] = int(yr)
-                except Exception:
-                    pass
-        return super().create(validated_data)
+        try:
+            data = validated_data.get("data") or {}
+            if isinstance(data, dict):
+                validated_data["plate_number"] = validated_data.get("plate_number") or data.get("plateNumber")
+                validated_data["chassis_number"] = validated_data.get("chassis_number") or data.get("chassisNumber")
+                validated_data["vin"] = validated_data.get("vin") or data.get("vin") or data.get("engineNumber")
+                validated_data["make"] = validated_data.get("make") or data.get("manufacturer")
+                validated_data["model"] = validated_data.get("model") or data.get("model")
+                yr = validated_data.get("year") or data.get("year")
+                if yr is not None:
+                    try:
+                        validated_data["year"] = int(yr)
+                    except Exception:
+                        pass
+            return super().create(validated_data)
+        except Exception as e:
+            import traceback
+            print(traceback.format_exc())
+            raise serializers.ValidationError({"detail": str(e)})
 
     def update(self, instance, validated_data):
         data = validated_data.get("data")

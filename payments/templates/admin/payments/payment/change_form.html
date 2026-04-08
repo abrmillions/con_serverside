@@ -1,0 +1,9 @@
+{% extends "admin/change_form.html" %}
+{% load i18n %}
+{% block object-tools-items %}
+{{ block.super }}
+<li><a href="{% url 'admin:payments_payment_mark_success' original.id %}">{% trans "Mark success" %}</a></li>
+<li><a href="{% url 'admin:payments_payment_mark_active' original.id %}">{% trans "Mark active" %}</a></li>
+<li><a href="{% url 'admin:payments_payment_mark_failed' original.id %}">{% trans "Mark failed" %}</a></li>
+<li><a href="{% url 'admin:payments_payment_mark_pending' original.id %}">{% trans "Mark pending" %}</a></li>
+{% endblock %}

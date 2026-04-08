@@ -1,11 +1,13 @@
-from rest_framework import generics, permissions, viewsets
+from rest_framework import generics, permissions, viewsets, serializers
 from django.contrib.auth import get_user_model
+from django.db import IntegrityError
 from .serializers import UserSerializer
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from rest_framework.permissions import IsAuthenticated, IsAdminUser
 from rest_framework_simplejwt.tokens import RefreshToken
+from datetime import timedelta
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import urlsafe_base64_encode, urlsafe_base64_decode
 from django.utils.encoding import force_bytes, force_str
@@ -45,19 +47,76 @@ class FlexibleTokenObtainPairSerializer(TokenObtainPairSerializer):
         username_field = get_user_model().USERNAME_FIELD
         incoming_email = attrs.get('email')
         incoming_username = attrs.get('username')
+        
+        # Determine the identifier used for login
+        identifier = incoming_email or incoming_username
+        
         if username_field == 'email':
             if incoming_email is None and incoming_username is not None:
                 attrs['email'] = incoming_username
         else:
             if incoming_username is None and incoming_email is not None:
                 attrs['username'] = incoming_email
-        return super().validate(attrs)
+
+        # Security: Check for failed login attempts if request is available
+        request = self.context.get('request')
+        if request and identifier:
+            ip_address = request.META.get('REMOTE_ADDR')
+            cache_key = f"login_attempts:{identifier}:{ip_address}"
+            attempts = cache.get(cache_key, 0)
+            
+            try:
+                settings_obj = SystemSettings.get_solo()
+                max_attempts = settings_obj.max_login_attempts
+            except Exception:
+                max_attempts = 5
+
+            if attempts >= max_attempts:
+                from rest_framework import serializers
+                raise serializers.ValidationError(
+                    f"Too many failed login attempts. Please try again later."
+                )
+
+        try:
+            data = super().validate(attrs)
+            
+            # Security: Set token lifetime dynamically from SystemSettings if desired
+            if request and identifier:
+                try:
+                    settings_obj = SystemSettings.get_solo()
+                    timeout_minutes = settings_obj.session_timeout
+                    
+                    # Override the access token lifetime in the response data if possible
+                    # Since TokenObtainPairSerializer doesn't easily expose the raw token object before it's 
+                    # turned into a string in `super().validate(attrs)`, we can re-generate them or 
+                    # rely on the fact that `super().validate(attrs)` returns the tokens.
+                    # A more reliable way is to manually set the lifetime if we have the user.
+                    if self.user:
+                        refresh = RefreshToken.for_user(self.user)
+                        refresh.access_token.set_exp(lifetime=timedelta(minutes=timeout_minutes))
+                        data['refresh'] = str(refresh)
+                        data['access'] = str(refresh.access_token)
+                        
+                    # For now, we'll clear attempts on success.
+                    cache.delete(cache_key)
+                except Exception:
+                    pass
+            return data
+        except Exception as e:
+            # Increment failed attempts on error
+            if request and identifier:
+                attempts = cache.get(cache_key, 0)
+                cache.set(cache_key, attempts + 1, timeout=3600)
+            raise e
 
 
 class FlexibleTokenObtainPairView(TokenObtainPairView):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     serializer_class = FlexibleTokenObtainPairSerializer
 
+
+from django.core.cache import cache
+from systemsettings.models import SystemSettings
 
 class TokenLoginView(APIView):
     permission_classes = (AllowAny,)
@@ -69,10 +128,50 @@ class TokenLoginView(APIView):
         password = request.data.get('password')
         if not identifier or not password:
             return Response({'detail': 'Email/username and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Security: Check for failed login attempts
+        ip_address = request.META.get('REMOTE_ADDR')
+        cache_key = f"login_attempts:{identifier}:{ip_address}"
+        attempts = cache.get(cache_key, 0)
+        
+        try:
+            settings_obj = SystemSettings.get_solo()
+            max_attempts = settings_obj.max_login_attempts
+        except Exception:
+            max_attempts = 5
+
+        if attempts >= max_attempts:
+            return Response(
+                {'detail': f'Too many failed login attempts. Please try again later.'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
         payload = {username_field: identifier, 'password': password}
         serializer = TokenObtainPairSerializer(data=payload)
+        
         if serializer.is_valid():
-            return Response(serializer.validated_data, status=status.HTTP_200_OK)
+            cache.delete(cache_key)
+            data = serializer.validated_data
+            
+            # Dynamic session timeout
+            try:
+                settings_obj = SystemSettings.get_solo()
+                timeout_minutes = settings_obj.session_timeout
+                
+                # Manually generate tokens to override lifetime
+                user = User.objects.filter(**{username_field: identifier}).first()
+                if user:
+                    refresh = RefreshToken.for_user(user)
+                    refresh.access_token.set_exp(lifetime=timedelta(minutes=timeout_minutes))
+                    data['refresh'] = str(refresh)
+                    data['access'] = str(refresh.access_token)
+            except Exception:
+                pass
+                
+            return Response(data, status=status.HTTP_200_OK)
+        
+        # Increment failed attempts on error
+        cache.set(cache_key, attempts + 1, timeout=3600)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 
@@ -91,6 +190,93 @@ class RegisterView(generics.CreateAPIView):
     permission_classes = (permissions.AllowAny,)
     serializer_class = UserSerializer
 
+    def create(self, request, *args, **kwargs):
+        try:
+            try:
+                data = request.data.copy()
+            except Exception:
+                # For non-dict bodies, fallback to serializer default handling
+                data = request.data
+            try:
+                # Handle full name splitting more robustly
+                full = (data.get('fullName') or data.get('full_name') or '').strip()
+                first = (data.get('first_name') or '').strip()
+                last = (data.get('last_name') or '').strip()
+
+                # If we only have first_name (common from frontend) and it contains spaces, split it
+                if first and not last and ' ' in first:
+                    parts = [p for p in first.split(' ') if p]
+                    if parts:
+                        data['first_name'] = parts[0]
+                        data['last_name'] = ' '.join(parts[1:])
+                # If we have fullName but not first/last
+                elif full and not first and not last:
+                    parts = [p for p in full.split(' ') if p]
+                    if parts:
+                        data['first_name'] = parts[0]
+                        if len(parts) > 1:
+                            # Join the remaining parts as last_name (Middle + Last)
+                            data['last_name'] = ' '.join(parts[1:])
+                
+                # Ensure username is set for admin compatibility
+                if not data.get('username'):
+                    data['username'] = data.get('email') or ''
+                    
+                # Final fallback: if first_name is still empty, use email prefix
+                if not data.get('first_name') and data.get('email'):
+                    data['first_name'] = data['email'].split('@')[0]
+                    
+                # Ensure password and password_confirm match for serializer validation
+                if 'password' in data and 'password_confirm' not in data:
+                    if 'confirmPassword' in data:
+                        data['password_confirm'] = data['confirmPassword']
+                    else:
+                        data['password_confirm'] = data['password']
+            except Exception:
+                pass
+                
+            serializer = self.get_serializer(data=data)
+            serializer.is_valid(raise_exception=True)
+            
+            try:
+                self.perform_create(serializer)
+                headers = self.get_success_headers(serializer.data)
+                return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+            except IntegrityError as e:
+                # Handle duplicate email/username explicitly
+                err_msg = str(e).lower()
+                if 'unique' in err_msg or 'duplicate' in err_msg:
+                    # Extract specific field if possible
+                    detail = 'A user with this email or username already exists.'
+                    if 'email' in err_msg:
+                        detail = 'This email is already registered.'
+                    elif 'username' in err_msg:
+                        detail = 'This username is already taken.'
+                    return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+                # Re-wrap as 400 instead of 500 for better client handling
+                return Response({'detail': f'Database error: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
+        except Exception as e:
+            # Log the full exception for backend debugging
+            import traceback
+            # eslint-disable-next-line no-console
+            print(f"Registration Error: {str(e)}")
+            traceback.print_exc()
+
+            # Handle DRF ValidationErrors specifically
+            if hasattr(e, 'detail') and isinstance(e.detail, (dict, list)):
+                return Response(e.detail, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Handle other validation errors (e.g. from models or serializers)
+            if hasattr(e, 'message_dict'):
+                return Response(e.message_dict, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Final fallback: wrap other exceptions
+            msg = str(e)
+            return Response(
+                {'detail': msg},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
 
 class MeView(generics.RetrieveUpdateAPIView):
     """Return or update the currently authenticated user's data."""
@@ -98,7 +284,11 @@ class MeView(generics.RetrieveUpdateAPIView):
     serializer_class = UserSerializer
 
     def get_object(self):
-        return self.request.user
+        try:
+            return self.request.user
+        except Exception:
+            from django.http import Http404
+            raise Http404("User not found")
 
 
 class LogoutView(APIView):
@@ -279,7 +469,11 @@ class EmailVerificationRequestView(APIView):
 
             return Response({'detail': 'Verification email sent.', 'verify_url': verify_url}, status=status.HTTP_200_OK)
         except Exception as e:
-            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            import traceback
+            # eslint-disable-next-line no-console
+            print(f"Email Verification Request Error: {str(e)}")
+            traceback.print_exc()
+            return Response({'detail': f'Verification failed: {str(e)}'}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class EmailVerificationConfirmView(APIView):
@@ -324,7 +518,11 @@ class GoogleLoginView(APIView):
 
     def get(self, request):
         client_id = os.environ.get('GOOGLE_CLIENT_ID') or ''
-        redirect_uri = os.environ.get('GOOGLE_REDIRECT_URI') or f"{request.scheme}://{request.get_host()}/api/users/google/callback/"
+        
+        # Allow frontend to specify where Google should redirect back to
+        provided_redirect_uri = request.query_params.get('redirect_uri')
+        redirect_uri = provided_redirect_uri or os.environ.get('GOOGLE_REDIRECT_URI') or f"{request.scheme}://{request.get_host()}/api/users/google/callback/"
+        
         scope = "openid email profile"
         if not client_id:
             return Response({'detail': 'Google OAuth not configured (missing GOOGLE_CLIENT_ID).'}, status=status.HTTP_501_NOT_IMPLEMENTED)
@@ -351,7 +549,11 @@ class GoogleCallbackView(APIView):
             return redirect(f"{frontend_url.rstrip('/')}/login?error=missing_code")
         client_id = os.environ.get('GOOGLE_CLIENT_ID') or ''
         client_secret = os.environ.get('GOOGLE_CLIENT_SECRET') or ''
-        redirect_uri = os.environ.get('GOOGLE_REDIRECT_URI') or f"{request.scheme}://{request.get_host()}/api/users/google/callback/"
+        
+        # Use provided redirect_uri if present, otherwise fallback to default
+        provided_redirect_uri = request.data.get('redirect_uri') or request.query_params.get('redirect_uri')
+        redirect_uri = provided_redirect_uri or os.environ.get('GOOGLE_REDIRECT_URI') or f"{request.scheme}://{request.get_host()}/api/users/google/callback/"
+        
         frontend_url = os.environ.get('FRONTEND_URL') or os.environ.get('NEXT_PUBLIC_FRONTEND_URL') or os.environ.get('DJANGO_FRONTEND_URL') or 'http://localhost:3000'
         if not client_id or not client_secret:
             return redirect(f"{frontend_url.rstrip('/')}/login?error=oauth_not_configured")
@@ -411,5 +613,96 @@ class GoogleCallbackView(APIView):
                 'prefill': '1'
             })
             return redirect(f"{frontend_url.rstrip('/')}/dashboard?{params}")
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def post(self, request):
+        code = request.data.get('code') or request.query_params.get('code')
+        if not code:
+            frontend_url = os.environ.get('FRONTEND_URL') or os.environ.get('NEXT_PUBLIC_FRONTEND_URL') or os.environ.get('DJANGO_FRONTEND_URL') or f"{request.scheme}://{request.get_host()}"
+            return Response({'detail': 'missing_code', 'redirect': f"{frontend_url.rstrip('/')}/login?error=missing_code"}, status=status.HTTP_400_BAD_REQUEST)
+        client_id = os.environ.get('GOOGLE_CLIENT_ID') or ''
+        client_secret = os.environ.get('GOOGLE_CLIENT_SECRET') or ''
+        
+        # Use provided redirect_uri if present, otherwise fallback to default
+        provided_redirect_uri = request.data.get('redirect_uri') or request.query_params.get('redirect_uri')
+        redirect_uri = provided_redirect_uri or os.environ.get('GOOGLE_REDIRECT_URI') or f"{request.scheme}://{request.get_host()}/api/users/google/callback/"
+        
+        frontend_url = os.environ.get('FRONTEND_URL') or os.environ.get('NEXT_PUBLIC_FRONTEND_URL') or os.environ.get('DJANGO_FRONTEND_URL') or 'http://localhost:3000'
+        if not client_id or not client_secret:
+            return Response({'detail': 'oauth_not_configured'}, status=status.HTTP_501_NOT_IMPLEMENTED)
+        try:
+            token_resp = requests.post('https://oauth2.googleapis.com/token', data={
+                'code': code,
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'redirect_uri': redirect_uri,
+                'grant_type': 'authorization_code',
+            }, timeout=10)
+            if token_resp.status_code != 200:
+                return Response({'detail': f'Failed to exchange code: {token_resp.text}'}, status=status.HTTP_400_BAD_REQUEST)
+            token_data = token_resp.json()
+            access_token = token_data.get('access_token')
+            if not access_token:
+                return Response({'detail': 'No access token returned from Google.'}, status=status.HTTP_400_BAD_REQUEST)
+            userinfo_resp = requests.get('https://www.googleapis.com/oauth2/v2/userinfo', headers={'Authorization': f'Bearer {access_token}'}, timeout=10)
+            if userinfo_resp.status_code != 200:
+                return Response({'detail': f'Failed to fetch user info: {userinfo_resp.text}'}, status=status.HTTP_400_BAD_REQUEST)
+            info = userinfo_resp.json()
+            email = info.get('email') or ''
+            given_name = info.get('given_name') or ''
+            family_name = info.get('family_name') or ''
+            if not email:
+                return Response({'detail': 'Google did not provide an email.'}, status=status.HTTP_400_BAD_REQUEST)
+            UserModel = get_user_model()
+            user = UserModel.objects.filter(email__iexact=email).first()
+            if not user:
+                user = UserModel.objects.create_user(email=email, username=email, first_name=given_name, last_name=family_name)
+            else:
+                if given_name and not user.first_name:
+                    user.first_name = given_name
+                if family_name and not user.last_name:
+                    user.last_name = family_name
+            user.email_verified = True
+            user.is_active = True
+            user.save()
+            refresh = RefreshToken.for_user(user)
+            access = str(refresh.access_token)
+            mode = request.data.get('mode') or request.query_params.get('mode') or ''
+            if str(mode).lower() == 'json':
+                return Response({
+                    'access': access,
+                    'refresh': str(refresh),
+                    'email': user.email,
+                    'firstName': user.first_name or '',
+                    'lastName': user.last_name or '',
+                }, status=status.HTTP_200_OK)
+            params = urllib.parse.urlencode({
+                'access': access,
+                'refresh': str(refresh),
+                'email': user.email,
+                'firstName': user.first_name or '',
+                'lastName': user.last_name or '',
+                'prefill': '1'
+            })
+            return redirect(f"{frontend_url.rstrip('/')}/dashboard?{params}")
+        except Exception as e:
+            return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class GoogleStatusView(APIView):
+    permission_classes = (AllowAny,)
+    def get(self, request):
+        try:
+            client_id = bool(os.environ.get('GOOGLE_CLIENT_ID'))
+            client_secret = bool(os.environ.get('GOOGLE_CLIENT_SECRET'))
+            redirect_uri = os.environ.get('GOOGLE_REDIRECT_URI') or ''
+            frontend_url = os.environ.get('FRONTEND_URL') or os.environ.get('NEXT_PUBLIC_FRONTEND_URL') or os.environ.get('DJANGO_FRONTEND_URL') or ''
+            return Response({
+                'configured': client_id and client_secret,
+                'client_id_present': client_id,
+                'client_secret_present': client_secret,
+                'redirect_uri_set': bool(redirect_uri),
+                'frontend_url_set': bool(frontend_url),
+            }, status=status.HTTP_200_OK)
         except Exception as e:
             return Response({'detail': str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

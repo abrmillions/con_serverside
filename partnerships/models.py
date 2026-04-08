@@ -64,11 +64,6 @@ class Partnership(models.Model):
     registration_data = models.JSONField(blank=True, null=True)
     partners_data = models.JSONField(blank=True, null=True)
 
-    class Meta:
-        constraints = [
-            models.UniqueConstraint(fields=["owner"], name="unique_partnership_per_owner"),
-        ]
-
     def __str__(self):
         return f"{self.main_contractor.name} + {self.partner_company.name}"
 
@@ -94,6 +89,14 @@ class PartnershipDocument(models.Model):
     document_type = models.CharField(max_length=64)
     file = models.FileField(upload_to="partnerships/documents/")
     uploaded_at = models.DateTimeField(auto_now_add=True)
+    verification_status = models.CharField(max_length=32, blank=True, default="", db_index=True)
+    verification_score = models.FloatField(null=True, blank=True)
+    verification_details = models.TextField(blank=True)
+    verified_at = models.DateTimeField(null=True, blank=True)
+
+    @property
+    def name(self):
+        return self.document_type
 
 
 class PartnershipApprovalLog(models.Model):
